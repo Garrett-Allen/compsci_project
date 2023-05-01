@@ -1,26 +1,121 @@
 ---
-title: "Compsci Code"
+title: "Compsci 390 Final Project"
 format: html
 editor: visual
 ---
 
-## Quarto
+```{r load packages}
+library(tidyverse)
+library(yardstick)
+library(ngram)
+library(randomForest)
+library(kgrams)
+library(stringr)
+library(udpipe)
+library(lattice)
 
-Quarto enables you to weave together content and executable code into a finished document. To learn more about Quarto see <https://quarto.org>.
+m_eng_ewt <- udpipe_download_model(language = "english-ewt")
+m_eng_ewt_path <- m_eng_ewt$file_model
+m_eng_ewt_loaded <- udpipe_load_model(file = m_eng_ewt_path)
 
-## Running Code
 
-When you click the **Render** button a document will be generated that includes both content and the output of embedded code. You can embed code like this:
-
-```{r}
-1 + 1
 ```
 
-You can add options to executable code like this
+```{r load and clean data}
+review_data <- read.csv("RAW_interactions.csv") %>% 
+  mutate(user_id = as.factor(user_id),
+         recipe_id = as.factor(recipe_id),
+         rating = as.factor(rating),
+         date = as.Date(date))
 
-```{r}
-#| echo: false
-2 * 2
+recipes_with_four_reviews <- review_data %>% 
+  group_by(recipe_id) %>% 
+  count() %>% 
+  filter(n >= 4) %>% 
+  pull(recipe_id)
+
+review_data <- review_data %>% 
+  filter(recipe_id %in% recipes_with_four_reviews) %>% 
+  mutate(review = str_replace_all(review,"&#039;","'"),
+         review = str_squish(review))
 ```
 
-The `echo: false` option disables the printing of code (only output is displayed).
+```{r EDA}
+review_data %>% 
+  ggplot(aes(x = rating)) + 
+  geom_bar() + 
+  theme_bw() + 
+  labs(x = "Rating",
+       y = "Frequency",
+       title = "Rating data is heavily skewed right")
+
+```
+
+```{r baseline model}
+# predict the most common one (5)
+
+review_data %>% 
+  count(rating) %>% 
+  mutate(perc = n / sum(n))
+
+accuracy_rmse_baseline <- review_data %>% 
+  mutate(baseline_model = 5) %>%
+  mutate(rating = as.numeric(rating) - 1) %>% 
+  summarize(
+    accuracy = mean(rating == baseline_model),
+    rmse = rmse_vec(rating, baseline_model)
+  )
+
+accuracy_rmse_baseline
+```
+
+```{r creating linguistically motivated features}
+sample <- review_data %>% 
+  slice(1) %>% 
+  pull(review)
+
+calc_percent_personal_pronoun <- function(sample){
+  
+  x <- udpipe_annotate(m_eng_ewt_loaded,x = sample) %>% 
+    as.data.frame() %>% 
+    separate_wider_delim(feats, names_sep = "_", delim = "|", too_few = "align_start")
+  
+  if(!("feats_4" %in% colnames(x))){
+    return(0)
+  }
+  
+  count_table <- x %>% 
+    group_by(sentence_id, feats_4) %>% 
+    count() %>% 
+    pivot_wider(names_from = feats_4, values_from = n)
+  
+  if(!("PronType=Prs" %in% colnames(count_table))){
+    return(0)
+  }
+  
+  value <- count_table %>% 
+    replace(is.na(.),0) %>% 
+    ungroup() %>% 
+    mutate(tot_words = rowSums(.) - sentence_id) %>% 
+    mutate(perc_prs = `PronType=Prs`/tot_words) %>% 
+    summarize(percent_pronoun = mean(perc_prs)) %>% 
+    pull()
+  
+  value
+}
+
+review_data %>% 
+  rowwise() %>% 
+  mutate(percent_personal_prounoun = calc_percent_personal_pronoun(review))
+
+  
+```
+```{r ngrams}
+
+
+review_data %>% 
+  rowwise() %>% 
+  mutate(ngram_obj_1 = list(try(ngram(review), silent = TRUE)))
+  
+
+```
