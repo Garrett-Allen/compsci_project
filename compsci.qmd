@@ -13,6 +13,8 @@ library(kgrams)
 library(stringr)
 library(udpipe)
 library(lattice)
+library(tidytext)
+library(syuzhet)
 
 m_eng_ewt <- udpipe_download_model(language = "english-ewt")
 m_eng_ewt_path <- m_eng_ewt$file_model
@@ -37,7 +39,8 @@ recipes_with_four_reviews <- review_data %>%
 review_data <- review_data %>% 
   filter(recipe_id %in% recipes_with_four_reviews) %>% 
   mutate(review = str_replace_all(review,"&#039;","'"),
-         review = str_squish(review))
+         review = str_squish(review),
+         num_words_review = str_count(review, pattern = " ") + 1)
 ```
 
 ```{r EDA}
@@ -104,10 +107,13 @@ calc_percent_personal_pronoun <- function(sample){
   value
 }
 
+##adding sentiments, personal pronouns
 review_data %>% 
-  rowwise() %>% 
-  mutate(percent_personal_prounoun = calc_percent_personal_pronoun(review))
-
+  slice(1:100) %>% 
+  mutate(sentiment = get_nrc_sentiment(review),
+         percent_pronoun = calc_percent_personal_pronoun(review),
+         num_words = ) %>% 
+  unnest()
   
 ```
 ```{r ngrams}
