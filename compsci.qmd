@@ -17,6 +17,7 @@ library(tidytext)
 library(qdap)
 library(syuzhet)
 library(quanteda)
+library(reticulate)
 
 m_eng_ewt <- udpipe_download_model(language = "english-ewt")
 m_eng_ewt_path <- m_eng_ewt$file_model
@@ -131,13 +132,31 @@ review_data_10000 <- review_data %>%
          num_punc_sent = mean(str_count(sent_detect_nlp(review),pattern = "[[:punct:]]"))
          ) %>% 
   unnest()
+  
 ```
 
-```{r ngrams}
+```{python passive sentences}
+import pandas
+from PassivePySrc import PassivePy
 
+passivepy = PassivePy.PassivePyAnalyzer(spacy_model = "en_core_web_lg")
 
-review_data_1000 %>% 
-  rowwise() %>% 
-  mutate(num_punc_sent = mean(str_count(sent_detect_nlp(review),pattern = "[[:punct:]]")))
+reviews = r.review_data_1000
+
+df_detected_s = passivepy.match_sentence_level(reviews, column_name= 'review',
+                                                batch_size = 1000, add_other_columns=True,
+                                                truncated_passive=False, full_passive=False)
+                                              
+```
+
+```{r full dataset}
+review_data_10000 <- py$df_detected_s %>% 
+  group_by(docId) %>% 
+  mutate(mean_passive = mean(unlist(binary))) %>% 
+  select(user_id,recipe_id,mean_passive) %>% 
+  ungroup(docId) %>% 
+  left_join(review_data_1000) %>% 
+  select(-docId) %>% 
+  distinct()
 
 ```
