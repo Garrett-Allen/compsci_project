@@ -18,6 +18,8 @@ library(qdap)
 library(syuzhet)
 library(quanteda)
 library(reticulate)
+library(e1071)
+library(glmnet)
 
 m_eng_ewt <- udpipe_download_model(language = "english-ewt")
 m_eng_ewt_path <- m_eng_ewt$file_model
@@ -31,7 +33,8 @@ review_data <- read.csv("RAW_interactions.csv") %>%
   mutate(user_id = as.factor(user_id),
          recipe_id = as.factor(recipe_id),
          rating = as.factor(rating),
-         date = as.Date(date))
+         date = as.Date(date)
+  )
 
 recipes_with_four_reviews <- review_data %>% 
   group_by(recipe_id) %>% 
@@ -43,7 +46,8 @@ review_data <- review_data %>%
   filter(recipe_id %in% recipes_with_four_reviews) %>% 
   mutate(review = str_replace_all(review,"&#039;","'"),
          review = str_squish(review),
-         num_words_review = str_count(review, pattern = " ") + 1)
+         num_words_review = str_count(review, pattern = " ") + 1,
+         id  = 1:n())
 ```
 
 ```{r EDA}
@@ -76,25 +80,7 @@ accuracy_rmse_baseline
 ```
 
 ```{r creating linguistically motivated features}
-sample <- review_data %>% 
-  slice(1) %>% 
-  pull(review)
-
-x <- udpipe_annotate(m_eng_ewt_loaded,x = sample) %>% 
-    as.data.frame() %>% 
-    separate_wider_delim(feats, names_sep = "_", delim = "|", too_few = "align_start") %>% 
-    group_by(sentence_id) %>% 
-    count(feats_4) %>% 
-
-
-  
-value <- count_table %>% 
-    replace(is.na(.),0) %>% 
-    ungroup() %>% 
-    mutate(tot_words = rowSums(.) - sentence_id) %>% 
-    mutate(perc_prs = `PronType=Prs`/tot_words) %>% 
-    summarize(percent_pronoun = mean(perc_prs)) %>% 
-    pull()
+set.seed(123)
 
 calc_percent_personal_pronoun <- function(sample){
   
@@ -121,7 +107,7 @@ calc_percent_personal_pronoun <- function(sample){
 }
 
 ##adding sentiments, personal pronouns
-review_data_10000 <- review_data %>% 
+review_data_1000 <- review_data %>% 
   sample_n(10000) %>% 
   rowwise() %>% 
   mutate(sentiment = get_nrc_sentiment(review),
@@ -150,7 +136,7 @@ df_detected_s = passivepy.match_sentence_level(reviews, column_name= 'review',
 ```
 
 ```{r full dataset}
-review_data_10000 <- py$df_detected_s %>% 
+review_data_1000 <- py$df_detected_s %>% 
   group_by(docId) %>% 
   mutate(mean_passive = mean(unlist(binary))) %>% 
   select(user_id,recipe_id,mean_passive) %>% 
@@ -158,5 +144,32 @@ review_data_10000 <- py$df_detected_s %>%
   left_join(review_data_1000) %>% 
   select(-docId) %>% 
   distinct()
+  
+```
 
+
+```{r train test split}
+n <- nrow(review_data_1000)
+
+review_data_1000 <- review_data_1000 %>% 
+  mutate(across(.cols = 8:17, as.factor)) %>% 
+  select(-date, -review, -user_id, -recipe_id)
+
+train <- review_data_1000 %>% 
+  sample_n(.8 * n)
+
+validate <- anti_join(review_data_1000,train) %>% 
+  sample_n(.1 * n)
+
+test <- anti_join(anti_join(review_data_1000,train),validate)
+```
+```{r modeling}
+#lasso
+kmer3model <- cv.glmnet(kmer3_x_training, family_training, family = "multinomial", nfolds = 5, type.measure = "class", trace.it = 1, parallel = TRUE)
+
+#random forest
+
+rf_model <- randomForest(rating ~ ., data = select(train,-id), ntree = 1000)
+
+#SVM
 ```
