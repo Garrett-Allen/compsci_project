@@ -1,5 +1,6 @@
 ---
 title: "Compsci 390 Final Project"
+author: Garrett Allen, Alex Bildner, Nathan Ostrowski
 format: html
 editor: visual
 ---
@@ -20,7 +21,13 @@ library(quanteda)
 library(reticulate)
 library(e1071)
 library(glmnet)
-
+library(kableExtra)
+library(caret)
+library(foreach)
+library(doParallel)
+library(neuralnet)
+library(keras)
+library(tensorflow)
 m_eng_ewt <- udpipe_download_model(language = "english-ewt")
 m_eng_ewt_path <- m_eng_ewt$file_model
 m_eng_ewt_loaded <- udpipe_load_model(file = m_eng_ewt_path)
@@ -57,7 +64,9 @@ review_data %>%
   theme_bw() + 
   labs(x = "Rating",
        y = "Frequency",
-       title = "Rating data is heavily skewed right")
+       title = "")
+
+ggsave("review_data.png")
 
 ```
 
@@ -84,26 +93,21 @@ set.seed(123)
 
 calc_percent_personal_pronoun <- function(sample){
   
-  x <- udpipe_annotate(m_eng_ewt_loaded,x = sample) %>% 
+  udpipe_annotate(m_eng_ewt_loaded,x = sample) %>% 
     as.data.frame() %>% 
-    separate_wider_delim(feats, names_sep = "_", delim = "|", too_few = "align_start")
-  
-  if(!("feats_4" %in% colnames(x))){
-    return(0)
-  }
-  
-  value <- x %>% 
-    group_by(sentence_id, feats_4) %>% 
-    count() %>% 
-    mutate(num_prontype = if_else(!is.na(feats_4) & feats_4 == "PronType=Prs", n, 0),
-           prontype_perc = num_prontype / sum(n)) %>% 
-    filter(is.na(feats_4) | feats_4 == "PronType=Prs") %>% 
+    mutate(personal_pronoun = if_else(is.na(feats),
+                                      FALSE,
+                                      str_detect(feats,pattern = "PronType=Prs")
+                                      )
+           ) %>% 
+    group_by(sentence_id) %>% 
+    count(personal_pronoun) %>% 
+    mutate(percent_type = n /sum(n)) %>% 
     slice(1) %>% 
+    mutate(percent_pronoun = 1 - percent_type) %>% 
     ungroup() %>% 
-    summarize(percent_pronoun = mean(prontype_perc)) %>% 
-    pull(percent_pronoun)
-  
-  value
+    summarize(value = mean(percent_pronoun)) %>% 
+    pull(value)
 }
 
 ##adding sentiments, personal pronouns
@@ -144,32 +148,264 @@ review_data_1000 <- py$df_detected_s %>%
   left_join(review_data_1000) %>% 
   select(-docId) %>% 
   distinct()
-  
-```
 
+write.csv(review_data_1000, "review_data_10000.csv")
+```
 
 ```{r train test split}
-n <- nrow(review_data_1000)
+set.seed(123)
+review_data_10000 <- read.csv("review_data_10000.csv")
+n <- nrow(review_data_10000)
 
-review_data_1000 <- review_data_1000 %>% 
-  mutate(across(.cols = 8:17, as.factor)) %>% 
-  select(-date, -review, -user_id, -recipe_id)
+review_data_10000 <- review_data_10000 %>% 
+  mutate(across(.cols = 6:15, as.factor),
+         rating = as.factor(rating)) %>% 
+  select(-X)
 
-train <- review_data_1000 %>% 
-  sample_n(.8 * n)
+review_data_10000 %>% 
+  count(rating)
 
-validate <- anti_join(review_data_1000,train) %>% 
-  sample_n(.1 * n)
+train <- review_data_10000 %>% 
+  sample_n(.8 * n) %>% 
+  select(-id)
 
-test <- anti_join(anti_join(review_data_1000,train),validate)
+test <- anti_join(review_data_10000,train) %>% 
+  select(-id)
 ```
-```{r modeling}
-#lasso
-kmer3model <- cv.glmnet(kmer3_x_training, family_training, family = "multinomial", nfolds = 5, type.measure = "class", trace.it = 1, parallel = TRUE)
 
+```{r lasso}
+train_label <- train$rating 
+train_covariates <- model.matrix(rating ~ ., data = train)
+lasso_review <- cv.glmnet(train_covariates, train_label, family = "multinomial", nfolds = 20, type.measure = "class", trace.it = 1, parallel = TRUE)
+
+coef(lasso_review)
+predict(lasso_review, train_covariates, type = "class")
+predict(lasso_review, model.matrix(rating ~ ., test), type = "class")
+
+lasso_accuracy_out <- test %>% 
+  mutate(predictions = predict(lasso_review, model.matrix(rating ~ ., test), type = "class")) %>% 
+  mutate(rating = as.numeric(rating) - 1,
+            predictions = as.numeric(predictions)) %>% 
+  summarize(rmse = rmse_vec(rating, predictions),
+            accuracy = mean(rating == predictions))
+# just does baseline model essentially, sets all coefs to zero
+
+rownames(lasso_accuracy_out) <- "Lasso Regression"
+
+```
+
+```{r random forest}
 #random forest
 
-rf_model <- randomForest(rating ~ ., data = select(train,-id), ntree = 1000)
+rf_model <- randomForest(rating ~ ., data = train, importance = TRUE, ntree = 1000)
+train %>%
+  mutate(predictions = predict(rf_model, train)) %>% 
+  summarize(accuracy = mean(predictions == rating))
 
-#SVM
+random_forest_out <- test %>% 
+  mutate(predictions = predict(rf_model, test)) %>% 
+  mutate(rating = as.numeric(rating) - 1,
+            predictions = as.numeric(predictions) -1) %>% 
+  summarize(rmse = rmse_vec(rating, predictions),
+            accuracy = mean(rating == predictions))
+
+rownames(random_forest_out) <- "Random Forest"
+
+varImpPlot(rf_model)
 ```
+            
+#SVM
+```{r svm}
+svm_model <- svm(rating ~ ., data = train, type = "C-classification",
+                 kernel = "radial")
+
+svm_accuracy_out <- test %>% 
+  mutate(predictions = predict(svm_model, test)) %>% 
+  mutate(rating = as.numeric(rating) - 1,
+            predictions = as.numeric(predictions) -1) %>% 
+  summarize(rmse = rmse_vec(rating, predictions),
+            accuracy = mean(rating == predictions))
+
+rownames(svm_accuracy_out) <- "SVM"
+#just does baseline
+svm_accuracy_out
+
+baseline_accuracy_out <- svm_accuracy_out 
+
+rownames(baseline_accuracy_out) <- "Baseline Model"
+```
+#naive bayes
+```{r naive bayes}
+naive_model <- naiveBayes(rating ~ ., data = train)
+
+train %>%
+  mutate(predictions = predict(naive_model, train)) %>% 
+  summarize(accuracy = mean(predictions == rating))
+
+naive_accuracy_out <- test %>% 
+  mutate(predictions = predict(naive_model, test)) %>% 
+  mutate(rating = as.numeric(rating) - 1,
+            predictions = as.numeric(predictions) -1) %>% 
+  summarize(rmse = rmse_vec(rating, predictions),
+            accuracy = mean(rating == predictions))
+naive_accuracy_out
+rownames(naive_accuracy_out) <- "Naive Bayes"
+```
+
+```{r total accuracy}
+rmse_table <- bind_rows(baseline_accuracy_out, 
+      naive_accuracy_out,
+      lasso_accuracy_out,
+      svm_accuracy_out,
+      random_forest_out,
+      ) %>% 
+  kable()
+
+rmse_table
+```
+
+```{r upsampling}
+train_upsample <- caret::upSample(x = train, y = train$rating) %>% 
+  select(-Class)
+
+train_upsample %>% 
+  count(rating)
+```
+
+```{r lasso_up}
+train_upsample_label <- train_upsample$rating 
+train_upsample_covariates <- model.matrix(rating ~ ., data = train_upsample)
+lasso_review_up <- cv.glmnet(train_upsample_covariates, train_upsample_label, family = "multinomial", nfolds = 20, type.measure = "class", trace.it = 1, parallel = TRUE)
+
+coef(lasso_review_up)
+predict(lasso_review_up, train_upsample_covariates, type = "class")
+
+lasso_accuracy_out_up <- test %>% 
+  mutate(predictions = predict(lasso_review_up, model.matrix(rating ~ ., test), type = "class")) %>% 
+  mutate(rating = as.numeric(rating) - 1,
+            predictions = as.numeric(predictions)) %>% 
+  summarize(rmse = rmse_vec(rating, predictions),
+            accuracy = mean(rating == predictions))
+# just does baseline model essentially, sets all coefs to zero
+
+rownames(lasso_accuracy_out_up) <- "Lasso Regression"
+
+lasso_accuracy_out_up
+
+
+```
+
+```{r random forest_up}
+#random forest
+library(foreach)
+doParallel::registerDoParallel(cores = 16)
+
+rf_model_up <- foreach(ntree=rep(188, 16), .combine=combine,.packages='randomForest') %dopar%
+  randomForest(rating ~ ., data = train_upsample, ntree=ntree)
+
+random_forest_out_up <- test %>% 
+  mutate(predictions = predict(rf_model_up, test)) %>% 
+  mutate(rating = as.numeric(rating) - 1,
+            predictions = as.numeric(predictions) -1) %>% 
+  summarize(rmse = rmse_vec(rating, predictions),
+            accuracy = mean(rating == predictions))
+
+rownames(random_forest_out_up) <- "Random Forest"
+
+
+random_forest_out_up
+varImpPlot(rf_model_up)
+```
+            
+#SVM
+```{r svm_up}
+svm_model_up <- svm(rating ~ ., data = train_upsample, type = "C-classification",
+                 kernel = "radial")
+
+svm_accuracy_out_up <- test %>% 
+  mutate(predictions = predict(svm_model_up, test)) %>% 
+  mutate(rating = as.numeric(rating) - 1,
+            predictions = as.numeric(predictions) -1) %>% 
+  summarize(rmse = rmse_vec(rating, predictions),
+            accuracy = mean(rating == predictions))
+
+rownames(svm_accuracy_out_up) <- "SVM"
+#just does baseline
+svm_accuracy_out_up
+
+rownames(baseline_accuracy_out) <- "Baseline Model"
+```
+#naive bayes
+```{r naive bayes_up}
+naive_model_up <- naiveBayes(rating ~ ., data = train_upsample)
+
+
+naive_accuracy_out_up <- test %>% 
+  mutate(predictions = predict(naive_model_up, test)) %>% 
+  mutate(rating = as.numeric(rating) - 1,
+            predictions = as.numeric(predictions) -1) %>% 
+  summarize(rmse = rmse_vec(rating, predictions),
+            accuracy = mean(rating == predictions))
+naive_accuracy_out_up
+rownames(naive_accuracy_out_up) <- "Naive Bayes"
+```
+
+```{r total accuracy_up}
+rmse_table <- bind_rows(baseline_accuracy_out, 
+      naive_accuracy_out_up,
+      lasso_accuracy_out_up,
+      svm_accuracy_out_up,
+      random_forest_out_up,
+      ) %>% 
+  kable()
+
+rmse_table
+```
+
+
+```{r one-shot model randomforest}
+
+train_one_vs_all <- train %>% 
+  mutate(zero_rating = if_else(rating == 0, 1, 0),
+         one_rating = if_else(rating == 1, 1, 0),
+         two_rating = if_else(rating == 2, 1, 0),
+         three_rating = if_else(rating == 3, 1, 0),
+         four_rating = if_else(rating == 4, 1, 0),
+         five_rating = if_else(rating == 5, 1, 0)
+  ) %>% 
+  mutate(across(.cols = zero_rating:five_rating, as.factor))
+
+train_one_vs_all %>% 
+  count(rating)
+rf_zero <- randomForest(zero_rating ~ ., data = train_one_vs_all %>% 
+                          select(-one_rating,-two_rating,-three_rating,-four_rating,-five_rating,-rating), ntree = 1000) 
+rf_one <- randomForest(one_rating ~ ., data = train_one_vs_all %>% 
+                          select(-zero_rating,-two_rating,-three_rating,-four_rating,-five_rating,-rating), ntree = 1000) 
+rf_two <- randomForest(two_rating ~ ., data = train_one_vs_all %>% 
+                          select(-one_rating,-zero_rating,-three_rating,-four_rating,-five_rating,-rating), ntree = 1000) 
+rf_three <- randomForest(three_rating ~ ., data = train_one_vs_all %>% 
+                          select(-one_rating,-two_rating,-zero_rating,-four_rating,-five_rating,-rating), ntree = 1000) 
+rf_four <- randomForest(four_rating ~ ., data = train_one_vs_all %>% 
+                          select(-one_rating,-two_rating,-three_rating,-zero_rating,-five_rating,-rating), ntree = 1000) 
+rf_five <- randomForest(five_rating ~ ., data = train_one_vs_all %>% 
+                          select(-one_rating,-two_rating,-three_rating,-four_rating,-zero_rating,-rating), ntree = 1000) 
+
+predictions <- test %>% 
+  mutate(zero_predict = predict(rf_zero, test, type = "prob")[,2],
+         one_predict = predict(rf_one, test, type = "prob")[,2],
+         two_predict = predict(rf_two, test, type = "prob")[,2],
+         three_predict = predict(rf_three, test, type = "prob")[,2],
+         four_predict = predict(rf_four, test, type = "prob")[,2],
+         five_predict = predict(rf_five, test, type = "prob")[,2]) %>% 
+  select(zero_predict:five_predict) %>% 
+  mutate(predicted_value = max.col(.) - 1) %>% 
+  mutate(truth = test$rating)
+
+test %>% 
+  mutate(predictions = predictions$predicted_value) %>% 
+  select(rating, predictions) %>% 
+  mutate(rating = as.numeric(rating) - 1) %>% 
+  summarize(rmse = rmse_vec(rating,predictions),
+            accuracy = mean(rating == predictions))
+```
+
